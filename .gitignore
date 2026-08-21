@@ -1,0 +1,116 @@
+# ==============================
+# Python
+# ==============================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+poetry.lock
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+wheels/
+pip-wheel-metadata/
+MANIFEST
+
+# PyInstaller (используется в build_macos.sh)
+*.manifest
+*.spec
+!pyproject.toml
+
+# ==============================
+# Virtual environments
+# ==============================
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ==============================
+# Testing / coverage
+# ==============================
+.pytest_cache/
+.tox/
+.nox/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+
+# ==============================
+# Type checking / linting caches
+# ==============================
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
+.pyre/
+
+# ==============================
+# IDE / editors
+# ==============================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ==============================
+# OS-specific
+# ==============================
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ==============================
+# Проектные данные пользователя
+# ==============================
+# Автосохранение проекта приложения
+.sp404_manager/
+
+# Экспортированные SD-карты / сэмплы (могут быть большими)
+/export/
+/out/
+*.zip
+SP-404SX_SD/
+
+# Аудиосэмплы пользователя (если попадут в репозиторий случайно)
+*.wav
+*.aif
+*.aiff
+*.mp3
+*.flac
+*.ogg
+!screenshot.png
+
+# Бинарные файлы PADINFO (генерируются при экспорте, не коммитим)
+PADINFO.BIN
+PAD_INFO.BIN
+
+# ==============================
+# macOS build артефакты (build_macos.sh)
+# ==============================
+*.app/
+*.dmg
+*.pkg
+*.icns.bak
+
+# ==============================
+# Логи
+# ==============================
+*.log
+logs/
