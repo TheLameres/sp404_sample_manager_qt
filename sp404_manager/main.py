@@ -9,15 +9,18 @@
 ╚══════════════════════════════════════════════════════════════╝
 """
 
+import logging
 import sys
 import json
+import threading
 import uuid
 import shutil
 from pathlib import Path
 from datetime import datetime
 
 from PySide6.QtCore import (Qt, QThread, Signal, QObject, QUrl, QSize,
-                            QMimeData, QByteArray, QTimer)
+                            QMimeData, QByteArray, QTimer, QtMsgType,
+                            qInstallMessageHandler)
 from PySide6.QtGui import QFont, QColor, QPalette, QIcon, QDrag, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -31,20 +34,43 @@ from .analyzer import (analyze_sample, CATEGORY_META, CATEGORY_ORDER,
                        SUPPORTED_EXT, HAVE_LIBROSA)
 from .exporter import export_sd, auto_assign, pad_to_filename
 from .platform_utils import get_app_dir, get_platform
+from .logging_setup import (setup_logging, get_logger, log_system_info,
+                            get_log_file, shutdown_logging)
+
+log = get_logger(__name__)
+_qt_log = get_logger("sp404_manager.qt")
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
 #  Конфигурация
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
 BANKS = list("ABCDEFGHIJKL")           # 12 банков
 PADS_PER_BANK = 12
 APP_DIR = Path(get_app_dir())
-APP_DIR.mkdir(parents=True, exist_ok=True)
 SAMPLES_DIR = APP_DIR / "samples"
-SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
 PROJECT_FILE = APP_DIR / "project.json"
 
 MIME_SAMPLE = "application/x-sp404-sample-id"
+
+
+def ensure_app_dirs() -> bool:
+    """Создаёт рабочие каталоги приложения.
+
+    Раньше mkdir() выполнялся на уровне модуля, то есть при импорте —
+    до того, как логирование настроено. Сбой (read-only том, нет прав,
+    отсутствующий %APPDATA%) приводил к падению на импорте вообще без
+    диагностики. Теперь это явный вызов из main() и MainWindow.__init__.
+    """
+    ok = True
+    for d in (APP_DIR, SAMPLES_DIR):
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            log.exception("Не удалось создать рабочий каталог %s", d)
+            ok = False
+    if ok:
+        log.debug("Рабочие каталоги готовы: %s", APP_DIR)
+    return ok
 
 
 # ─────────────────────────────────────────────
@@ -102,6 +128,7 @@ class AnalyzeWorker(QObject):
     progress = Signal(int, int)          # done, total
     one_done = Signal(dict)              # готовый sample dict
     finished = Signal(int)              # сколько добавлено
+    failed = Signal(str)                 # непредвиденный сбой воркера
 
     def __init__(self, filepaths):
         super().__init__()
@@ -110,36 +137,56 @@ class AnalyzeWorker(QObject):
     def run(self):
         total = len(self.filepaths)
         added = 0
-        for i, src in enumerate(self.filepaths):
-            src = Path(src)
-            if src.suffix.lower() not in SUPPORTED_EXT:
-                self.progress.emit(i + 1, total)
-                continue
-            # копируем в хранилище приложения
-            dest = SAMPLES_DIR / src.name
-            j = 1
-            while dest.exists():
-                dest = SAMPLES_DIR / f"{src.stem}_{j}{src.suffix}"
-                j += 1
-            try:
-                shutil.copy2(str(src), str(dest))
-            except Exception:
-                self.progress.emit(i + 1, total)
-                continue
+        log.info("Импорт: анализирую %d файл(ов)", total)
+        try:
+            for i, src in enumerate(self.filepaths):
+                src = Path(src)
+                if src.suffix.lower() not in SUPPORTED_EXT:
+                    log.debug("Пропущен неподдерживаемый файл: %s", src.name)
+                    self.progress.emit(i + 1, total)
+                    continue
+                # копируем в хранилище приложения
+                dest = SAMPLES_DIR / src.name
+                j = 1
+                while dest.exists():
+                    dest = SAMPLES_DIR / f"{src.stem}_{j}{src.suffix}"
+                    j += 1
+                try:
+                    shutil.copy2(str(src), str(dest))
+                except Exception:
+                    # Раньше файл просто "не появлялся" в списке без
+                    # единого объяснения — почти неотличимо от того, что
+                    # librosa не смогла его классифицировать.
+                    log.warning("Не удалось скопировать %s в хранилище",
+                                src, exc_info=True)
+                    self.progress.emit(i + 1, total)
+                    continue
 
-            info = analyze_sample(dest)
-            sample = {
-                "id":       f"s_{uuid.uuid4().hex[:8]}",
-                "name":     dest.name,
-                "path":     str(dest),
-                "category": info["category"],
-                "duration": info.get("duration", 0),
-                "tempo":    info.get("tempo", 0),
-                "analyzed": info.get("analyzed", False),
-            }
-            self.one_done.emit(sample)
-            added += 1
-            self.progress.emit(i + 1, total)
+                info = analyze_sample(dest)
+                sample = {
+                    "id":       f"s_{uuid.uuid4().hex[:8]}",
+                    "name":     dest.name,
+                    "path":     str(dest),
+                    "category": info["category"],
+                    "duration": info.get("duration", 0),
+                    "tempo":    info.get("tempo", 0),
+                    "analyzed": info.get("analyzed", False),
+                }
+                self.one_done.emit(sample)
+                added += 1
+                self.progress.emit(i + 1, total)
+        except Exception as e:
+            # Без этого except необработанное исключение убивало QThread
+            # молча: finished никогда не эмитился, прогресс-бар в GUI
+            # оставался висеть навечно (см. шаг 2, threading.excepthook
+            # не покрывает QThread во всех сборках PySide6). Эмитим
+            # только failed (как и ExportWorker) — иначе оба обработчика
+            # сработают на один и тот же сбой и сообщение об ошибке в
+            # статус-баре тут же перезатрётся сообщением об успехе.
+            log.exception("AnalyzeWorker: сбой после %d/%d файлов", added, total)
+            self.failed.emit(str(e))
+            return
+        log.info("Импорт завершён: добавлено %d из %d", added, total)
         self.finished.emit(added)
 
 
@@ -149,6 +196,7 @@ class AnalyzeWorker(QObject):
 class ExportWorker(QObject):
     progress = Signal(int, int)
     finished = Signal(dict)
+    failed = Signal(str)                 # непредвиденный сбой воркера
 
     def __init__(self, assignments, samples, out_dir, make_zip=True):
         super().__init__()
@@ -158,23 +206,32 @@ class ExportWorker(QObject):
         self.make_zip = make_zip
 
     def run(self):
-        result = export_sd(self.assignments, self.samples, self.out_dir,
-                           progress_cb=lambda d, t: self.progress.emit(d, t))
-        # манифест
-        manifest = {
-            "project": "SP-404SX export",
-            "exported_at": datetime.now().isoformat(),
-            "pads": result["exported"],
-            "errors": result["errors"],
-        }
-        with open(self.out_dir / "manifest.json", "w", encoding="utf-8") as f:
-            json.dump(manifest, f, ensure_ascii=False, indent=2)
+        try:
+            result = export_sd(self.assignments, self.samples, self.out_dir,
+                               progress_cb=lambda d, t: self.progress.emit(d, t))
+            # манифест
+            manifest = {
+                "project": "SP-404SX export",
+                "exported_at": datetime.now().isoformat(),
+                "pads": result["exported"],
+                "errors": result["errors"],
+            }
+            with open(self.out_dir / "manifest.json", "w", encoding="utf-8") as f:
+                json.dump(manifest, f, ensure_ascii=False, indent=2)
 
-        result["zip"] = None
-        if self.make_zip:
-            zip_base = str(self.out_dir.parent / (self.out_dir.name + "_SP404SX"))
-            zip_path = shutil.make_archive(zip_base, "zip", str(self.out_dir))
-            result["zip"] = zip_path
+            result["zip"] = None
+            if self.make_zip:
+                zip_base = str(self.out_dir.parent / (self.out_dir.name + "_SP404SX"))
+                zip_path = shutil.make_archive(zip_base, "zip", str(self.out_dir))
+                result["zip"] = zip_path
+        except Exception as e:
+            # Как и в AnalyzeWorker: без этого except сбой (например,
+            # переполнен диск при записи ZIP, нет прав на out_dir) убивал
+            # поток без единого сигнала — GUI навечно оставался с
+            # прогресс-баром экспорта и без диагностики.
+            log.exception("ExportWorker: непредвиденный сбой экспорта")
+            self.failed.emit(str(e))
+            return
         self.finished.emit(result)
 
 
@@ -346,6 +403,9 @@ class SampleList(QListWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        # Каталоги создаём здесь, а не на импорте модуля: headless-тесты
+        # и внешние скрипты конструируют окно напрямую, минуя main().
+        ensure_app_dirs()
         self.setWindowTitle("SP-404SX Sample Manager — by SYNTX.AI")
         self.resize(1180, 780)
         self.setAcceptDrops(True)
@@ -588,11 +648,16 @@ class MainWindow(QMainWindow):
     def _assign(self, pad_id, sample_id):
         if sample_id is None:
             self.assignments.pop(pad_id, None)
+            log.debug("Пэд %s очищен пользователем", pad_id)
             self._flash(f"Пэд {pad_id} очищен")
         else:
             if sample_id not in self.samples:
+                log.warning("Попытка назначить несуществующий сэмпл %s на "
+                            "пэд %s", sample_id, pad_id)
                 return
             self.assignments[pad_id] = sample_id
+            log.info("Назначено: «%s» -> %s",
+                     self.samples[sample_id]["name"], pad_id)
             self._flash(f"«{self.samples[sample_id]['name']}» → {pad_id}")
         if pad_id in self.pads:
             sid = self.assignments.get(pad_id)
@@ -604,6 +669,7 @@ class MainWindow(QMainWindow):
         if not self.samples:
             self._flash("⚠️ Нет сэмплов для раскладки")
             return
+        log.info("Авто-раскладка: %d сэмплов", len(self.samples))
         self.assignments = auto_assign(self.samples, BANKS, PADS_PER_BANK)
         self._render_pads()
         self._update_stats()
@@ -616,6 +682,8 @@ class MainWindow(QMainWindow):
         r = QMessageBox.question(self, "Очистить пэды",
                                  "Снять все назначения пэдов?")
         if r == QMessageBox.Yes:
+            log.info("Пользователь очистил все назначения (%d пэдов)",
+                     len(self.assignments))
             self.assignments = {}
             self._render_pads()
             self._update_stats()
@@ -637,11 +705,16 @@ class MainWindow(QMainWindow):
                                  f"Удалить «{s['name']}» из проекта?")
         if r != QMessageBox.Yes:
             return
+        log.info("Удаление сэмпла «%s»", s["name"])
         self.samples.pop(sid, None)
         try:
             Path(s["path"]).unlink(missing_ok=True)
         except Exception:
-            pass
+            # Файл на диске не удалился (нет прав, уже удалён извне) —
+            # проект всё равно продолжит без него, но раньше это было
+            # совершенно незаметно даже при повторяющемся сбое.
+            log.warning("Не удалось удалить файл %s с диска", s["path"],
+                        exc_info=True)
         self.assignments = {p: v for p, v in self.assignments.items() if v != sid}
         self._render_pads()
         self._render_samples()
@@ -651,9 +724,18 @@ class MainWindow(QMainWindow):
     # ── Аудио ──
     def _play_sample(self, sid):
         s = self.samples.get(sid)
-        if s and Path(s["path"]).exists():
-            self.player.setSource(QUrl.fromLocalFile(s["path"]))
-            self.player.play()
+        if not s:
+            return
+        if not Path(s["path"]).exists():
+            # Раньше клик по пропавшему файлу просто ничего не делал —
+            # пользователь не понимал, почему сэмпл не звучит.
+            log.warning("Файл сэмпла «%s» отсутствует на диске: %s",
+                        s["name"], s["path"])
+            self._flash(f"⚠️ Файл «{s['name']}» не найден на диске")
+            return
+        log.debug("Воспроизведение: %s", s["name"])
+        self.player.setSource(QUrl.fromLocalFile(s["path"]))
+        self.player.play()
 
     def _play_pad(self, pad_id):
         sid = self.assignments.get(pad_id)
@@ -665,6 +747,7 @@ class MainWindow(QMainWindow):
         if self._thread and self._thread.isRunning():
             self._flash("⏳ Дождись окончания текущей операции")
             return
+        log.info("Запуск импорта: %d файл(ов)", len(filepaths))
         self.progress.setRange(0, len(filepaths))
         self.progress.setValue(0)
         self.progress.show()
@@ -677,6 +760,7 @@ class MainWindow(QMainWindow):
         self._worker.one_done.connect(self._on_sample_added)
         self._worker.progress.connect(lambda d, t: self.progress.setValue(d))
         self._worker.finished.connect(self._on_import_done)
+        self._worker.failed.connect(self._on_worker_failed)
         self._thread.start()
 
     def _on_sample_added(self, sample):
@@ -702,6 +786,8 @@ class MainWindow(QMainWindow):
         if not out:
             return
         out_dir = Path(out) / "SP-404SX_SD"
+        log.info("Запуск экспорта: %d пэдов -> %s",
+                 len(self.assignments), out_dir)
 
         self.progress.setRange(0, len(self.assignments))
         self.progress.setValue(0)
@@ -715,6 +801,7 @@ class MainWindow(QMainWindow):
         self._thread.started.connect(self._worker.run)
         self._worker.progress.connect(lambda d, t: self.progress.setValue(d))
         self._worker.finished.connect(self._on_export_done)
+        self._worker.failed.connect(self._on_worker_failed)
         self._thread.start()
 
     def _on_export_done(self, result):
@@ -723,6 +810,7 @@ class MainWindow(QMainWindow):
         self.progress.hide()
         n = len(result["exported"])
         errs = result["errors"]
+        log.info("Экспорт завершён: %d сэмплов, %d ошибок", n, len(errs))
         msg = f"💾 Экспортировано {n} сэмплов."
         if result.get("zip"):
             msg += f"\n\nZIP: {result['zip']}"
@@ -730,6 +818,26 @@ class MainWindow(QMainWindow):
             msg += f"\n\n⚠️ Ошибок: {len(errs)}\n" + "\n".join(errs[:5])
         QMessageBox.information(self, "Экспорт завершён", msg)
         self._flash(f"✅ Экспортировано {n} сэмплов в формат SP-404SX")
+
+    def _on_worker_failed(self, message):
+        """Общий обработчик сигнала failed от AnalyzeWorker/ExportWorker.
+
+        Без этого слота непойманное исключение в воркере (см. защиту в
+        run()) оставляло бы прогресс-бар висеть навечно: finished в этом
+        случае не эмитится, поток остаётся "выполняющимся" для GUI.
+        Полный traceback уже записан воркером через log.exception —
+        здесь только приводим интерфейс в консистентное состояние.
+        """
+        log.error("Фоновая операция прервана ошибкой: %s", message)
+        if self._thread is not None:
+            self._thread.quit()
+            self._thread.wait()
+        self.progress.hide()
+        self._flash(f"❌ Ошибка: {message}")
+        QMessageBox.critical(
+            self, "Ошибка фоновой операции",
+            f"Операция не завершилась из-за непредвиденной ошибки:\n\n{message}\n\n"
+            f"Подробности записаны в файл лога.")
 
     # ── Drag & drop файлов в окно ──
     def dragEnterEvent(self, e):
@@ -746,6 +854,7 @@ class MainWindow(QMainWindow):
                 for f in p.rglob("*"):
                     if f.suffix.lower() in SUPPORTED_EXT:
                         paths.append(str(f))
+        log.debug("Drag&drop: %d файл(ов) распознано", len(paths))
         if paths:
             self._import_files(paths)
 
@@ -757,28 +866,128 @@ class MainWindow(QMainWindow):
             with open(PROJECT_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception:
-            pass
+            # Это худший из тихих сбоев в приложении: пользователь
+            # продолжает работать, уверенный, что проект сохраняется,
+            # а на деле каждое изменение теряется молча. _save_project
+            # вызывается после почти любого действия (импорт, назначение,
+            # удаление) — раньше ни одно из них не оставляло следа при сбое.
+            log.exception("Не удалось сохранить проект в %s", PROJECT_FILE)
 
     def _load_project(self):
-        if PROJECT_FILE.exists():
-            try:
-                with open(PROJECT_FILE, encoding="utf-8") as f:
-                    data = json.load(f)
-                # оставляем только существующие файлы
-                self.samples = {k: v for k, v in data.get("samples", {}).items()
-                                if Path(v["path"]).exists()}
-                self.assignments = {p: s for p, s in data.get("assignments", {}).items()
-                                    if s in self.samples}
-            except Exception:
-                pass
+        if not PROJECT_FILE.exists():
+            log.debug("Файл проекта не найден (%s) — старт с пустого проекта",
+                      PROJECT_FILE)
+            return
+        try:
+            with open(PROJECT_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            # оставляем только существующие файлы
+            samples = {k: v for k, v in data.get("samples", {}).items()
+                      if Path(v["path"]).exists()}
+            missing = len(data.get("samples", {})) - len(samples)
+            self.samples = samples
+            self.assignments = {p: s for p, s in data.get("assignments", {}).items()
+                                if s in self.samples}
+            log.info("Проект загружен: %d сэмплов, %d назначений%s",
+                     len(self.samples), len(self.assignments),
+                     f" ({missing} файл(ов) не найдено на диске)" if missing else "")
+        except Exception:
+            # Раньше битый/несовместимый project.json приводил к тихому
+            # старту с пустым проектом — пользователь терял весь список
+            # сэмплов и назначений без единого объяснения почему.
+            log.exception("Не удалось загрузить проект из %s — "
+                          "продолжаю с пустым проектом", PROJECT_FILE)
 
     def _flash(self, msg):
+        log.debug("[статус] %s", msg)
         self.status.showMessage(msg, 5000)
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
+#  Глобальные перехватчики ошибок
+# ─────────────────────────────────────────────────────────────────────
+_QT_MSG_LEVELS = {
+    QtMsgType.QtDebugMsg:    logging.DEBUG,
+    QtMsgType.QtInfoMsg:     logging.INFO,
+    QtMsgType.QtWarningMsg:  logging.WARNING,
+    QtMsgType.QtCriticalMsg: logging.ERROR,
+    QtMsgType.QtFatalMsg:    logging.CRITICAL,
+}
+
+
+def _qt_message_handler(mode, context, message):
+    """Перенаправляет диагностику Qt в logging.
+
+    Предупреждения Qt (проблемы компоновки, отсутствующие мультимедиа-
+    бэкенды, ошибки QMediaPlayer) писались прямо в stderr и в собранном
+    .app пропадали бесследно.
+    """
+    level = _QT_MSG_LEVELS.get(mode, logging.INFO)
+    where = ""
+    if context is not None and getattr(context, "file", None):
+        where = f" ({context.file}:{context.line})"
+    _qt_log.log(level, "%s%s", message, where)
+
+
+def _show_crash_dialog(exc_value) -> None:
+    """Показывает пользователю диалог о сбое с путём к файлу лога."""
+    try:
+        if QApplication.instance() is None:
+            return
+        log_path = get_log_file()
+        box = QMessageBox()
+        box.setIcon(QMessageBox.Critical)
+        box.setWindowTitle("Непредвиденная ошибка")
+        box.setText("Произошла непредвиденная ошибка.\n"
+                    "Приложение продолжит работу, но состояние может быть "
+                    "некорректным.")
+        box.setInformativeText(f"{type(exc_value).__name__}: {exc_value}")
+        if log_path:
+            box.setDetailedText(f"Подробности записаны в лог:\n{log_path}")
+        box.exec()
+    except Exception:
+        # Диалог — не критичный путь: traceback уже в логе.
+        log.exception("Не удалось показать диалог об ошибке")
+
+
+def _excepthook(exc_type, exc_value, exc_tb):
+    """sys.excepthook — необработанные исключения главного потока."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+        return
+    log.critical("Необработанное исключение в главном потоке",
+                 exc_info=(exc_type, exc_value, exc_tb))
+    _show_crash_dialog(exc_value)
+
+
+def _thread_excepthook(args):
+    """threading.excepthook — необработанные исключения фоновых потоков.
+
+    Внимание: QThread создаётся средствами Qt, а не модулем threading,
+    поэтому падение внутри AnalyzeWorker.run/ExportWorker.run этот хук
+    перехватит не во всех сборках PySide6. Надёжная защита воркеров —
+    явный try/except в самих run() (шаг 4). Хук оставлен как страховка
+    и покрывает обычные threading.Thread.
+    """
+    if issubclass(args.exc_type, SystemExit):
+        return
+    log.critical("Необработанное исключение в потоке %s",
+                 getattr(args.thread, "name", "?"),
+                 exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+
+def install_error_handlers() -> None:
+    """Ставит перехватчики. Вызывать один раз, до создания QApplication."""
+    sys.excepthook = _excepthook
+    if hasattr(threading, "excepthook"):        # Python 3.8+
+        threading.excepthook = _thread_excepthook
+    qInstallMessageHandler(_qt_message_handler)
+    log.debug("Глобальные перехватчики ошибок установлены")
+
+
+# ─────────────────────────────────────────────────────────────────────
 #  Точка входа
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
 def _default_font_family() -> str:
     """Системный шрифт под текущую ОС (на macOS нет 'Segoe UI')."""
     plat = get_platform()
@@ -790,6 +999,14 @@ def _default_font_family() -> str:
 
 
 def main():
+    # Логирование поднимаем самым первым — до Qt, до создания каталогов,
+    # чтобы любой последующий сбой оказался в файле.
+    setup_logging()
+    log_system_info()
+    install_error_handlers()
+    ensure_app_dirs()
+
+    log.info("Запуск приложения")
     app = QApplication(sys.argv)
     app.setApplicationName("SP-404SX Sample Manager")
     app.setApplicationDisplayName("SP-404SX Sample Manager")
@@ -800,7 +1017,12 @@ def main():
     app.setStyleSheet(STYLESHEET)
     win = MainWindow()
     win.show()
-    sys.exit(app.exec())
+
+    log.info("Главное окно показано, вход в цикл событий")
+    rc = app.exec()
+    log.info("Цикл событий завершён, код возврата=%s", rc)
+    shutdown_logging()
+    sys.exit(rc)
 
 
 if __name__ == "__main__":
