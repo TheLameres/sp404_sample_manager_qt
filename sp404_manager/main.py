@@ -26,19 +26,119 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QListWidget, QListWidgetItem, QFileDialog, QComboBox,
     QFrame, QScrollArea, QSizePolicy, QProgressBar, QMessageBox, QMenu,
-    QStatusBar, QAbstractItemView
+    QStatusBar, QAbstractItemView, QDialog, QDialogButtonBox, QFormLayout,
+    QDoubleSpinBox, QCheckBox
 )
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 
 from .analyzer import (analyze_sample, CATEGORY_META, CATEGORY_ORDER,
                        SUPPORTED_EXT, HAVE_LIBROSA)
-from .exporter import export_sd, auto_assign, pad_to_filename
+from .exporter import export_sd, auto_assign, pad_to_filename, PadInfoRecord
 from .platform_utils import get_app_dir, get_platform
 from .logging_setup import (setup_logging, get_logger, log_system_info,
                             get_log_file, shutdown_logging)
 
 log = get_logger(__name__)
 _qt_log = get_logger("sp404_manager.qt")
+
+
+# ────────────────────────────────────────────────────────────
+#  Диалог редактирования параметров PADINFO для одного пэда
+#  (BPM, тип воспроизведения Loop/Gate/Reverse/LoFi, формат)
+# ────────────────────────────────────────────────────────────
+class PadInfoEditorDialog(QDialog):
+    """Редактор параметров записи PADINFO.BIN для одного пэда.
+
+    Позволяет менять:
+      - BPM (User Tempo) — используется устройством для синхронизации темпа
+      - Loop / Gate / Reverse / LoFi — тип воспроизведения сэмпла
+      - Volume — громкость пэда (0-127)
+
+    Возвращает dict с полями, совместимый с `padinfo_records[pad_id]`
+    в exporter.export_sd().
+    """
+
+    def __init__(self, pad_id: str, sample_name: str, record: PadInfoRecord,
+                 parent=None):
+        super().__init__(parent)
+        self.pad_id = pad_id
+        self.record = record
+        self.setWindowTitle(f"Параметры пэда {pad_id}")
+        self.setMinimumWidth(340)
+        self._build_ui(sample_name)
+
+    def _build_ui(self, sample_name: str):
+        layout = QVBoxLayout(self)
+
+        title = QLabel(f"🎛️  Пэд {self.pad_id}")
+        title.setStyleSheet("font-size:15px;font-weight:700;")
+        layout.addWidget(title)
+
+        subtitle = QLabel(sample_name or "— сэмпл не назначен —")
+        subtitle.setObjectName("tag")
+        layout.addWidget(subtitle)
+
+        form = QFormLayout()
+        form.setSpacing(10)
+
+        # BPM
+        self.bpm_spin = QDoubleSpinBox()
+        self.bpm_spin.setRange(PadInfoRecord.MIN_BPM, PadInfoRecord.MAX_BPM)
+        self.bpm_spin.setDecimals(1)
+        self.bpm_spin.setSingleStep(0.1)
+        self.bpm_spin.setValue(self.record.user_tempo / 10.0)
+        self.bpm_spin.setSuffix(" BPM")
+        form.addRow("Темп (User Tempo):", self.bpm_spin)
+
+        # Volume
+        self.volume_spin = QDoubleSpinBox()
+        self.volume_spin.setDecimals(0)
+        self.volume_spin.setRange(0, 127)
+        self.volume_spin.setValue(self.record.volume)
+        form.addRow("Громкость:", self.volume_spin)
+
+        # Loop / Gate / Reverse / LoFi — тип воспроизведения
+        self.loop_check = QCheckBox("Loop (циклическое воспроизведение)")
+        self.loop_check.setChecked(bool(self.record.loop))
+        form.addRow(self.loop_check)
+
+        self.gate_check = QCheckBox("Gate (играть, пока держишь пэд)")
+        self.gate_check.setChecked(bool(self.record.gate))
+        form.addRow(self.gate_check)
+
+        self.reverse_check = QCheckBox("Reverse (реверс воспроизведения)")
+        self.reverse_check.setChecked(bool(self.record.reverse))
+        form.addRow(self.reverse_check)
+
+        self.lofi_check = QCheckBox("LoFi (эффект лоу-фай)")
+        self.lofi_check.setChecked(bool(self.record.lofi))
+        form.addRow(self.lofi_check)
+
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_values(self) -> dict:
+        """Возвращает изменённые параметры как dict для padinfo_records.
+
+        Все ключи соответствуют атрибутам PadInfoRecord — export_sd()
+        применяет их через setattr(rec, k, v), поэтому bpm сразу
+        конвертируется в uint32 (BPM x 10) и пишется в orig_tempo/user_tempo.
+        """
+        tempo_val = round(self.bpm_spin.value() * 10)
+        return {
+            "volume": int(self.volume_spin.value()),
+            "loop": 1 if self.loop_check.isChecked() else 0,
+            "gate": 1 if self.gate_check.isChecked() else 0,
+            "reverse": 1 if self.reverse_check.isChecked() else 0,
+            "lofi": 1 if self.lofi_check.isChecked() else 0,
+            "orig_tempo": tempo_val,
+            "user_tempo": tempo_val,
+        }
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -198,17 +298,20 @@ class ExportWorker(QObject):
     finished = Signal(dict)
     failed = Signal(str)                 # непредвиденный сбой воркера
 
-    def __init__(self, assignments, samples, out_dir, make_zip=True):
+    def __init__(self, assignments, samples, out_dir, make_zip=True,
+                 padinfo_records=None):
         super().__init__()
         self.assignments = assignments
         self.samples = samples
         self.out_dir = Path(out_dir)
         self.make_zip = make_zip
+        self.padinfo_records = padinfo_records or {}
 
     def run(self):
         try:
             result = export_sd(self.assignments, self.samples, self.out_dir,
-                               progress_cb=lambda d, t: self.progress.emit(d, t))
+                               progress_cb=lambda d, t: self.progress.emit(d, t),
+                               padinfo_records=self.padinfo_records)
             # манифест
             manifest = {
                 "project": "SP-404SX export",
@@ -242,6 +345,7 @@ class PadWidget(QFrame):
     clicked   = Signal(str)               # pad_id
     assigned  = Signal(str, str)          # pad_id, sample_id (drop)
     cleared   = Signal(str)               # pad_id
+    edit_requested = Signal(str)          # pad_id — правый клик, редактор PADINFO
 
     def __init__(self, pad_id: str):
         super().__init__()
@@ -350,6 +454,8 @@ class PadWidget(QFrame):
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton and self.sample:
             self.clicked.emit(self.pad_id)
+        elif e.button() == Qt.RightButton:
+            self.edit_requested.emit(self.pad_id)
 
 
 # ─────────────────────────────────────────────
@@ -413,6 +519,7 @@ class MainWindow(QMainWindow):
         # состояние
         self.samples = {}                 # id -> sample dict
         self.assignments = {}             # pad_id -> sample_id
+        self.padinfo_overrides = {}       # pad_id -> dict с кастомными полями PadInfoRecord
         self.cur_bank = "A"
         self.filter_cat = "all"
         self.pads = {}                    # pad_id -> PadWidget (текущий банк)
@@ -590,11 +697,42 @@ class MainWindow(QMainWindow):
             pw.assigned.connect(self._assign)
             pw.cleared.connect(self._clear_pad)
             pw.clicked.connect(self._play_pad)
+            pw.edit_requested.connect(self._edit_pad_info)
             self.pad_grid.addWidget(pw, row, col)
             self._pad_slots.append(pw)
 
     def _clear_pad(self, pad_id):
         self._assign(pad_id, None)
+
+    def _edit_pad_info(self, pad_id):
+        """Открывает диалог редактирования PADINFO для пэда (правый клик).
+
+        Работает даже если пэд пуст — можно заранее настроить параметры
+        (BPM, Loop/Gate/Reverse/LoFi, Volume), они применятся на экспорте.
+        """
+        sample_id = self.assignments.get(pad_id)
+        sample = self.samples.get(sample_id) if sample_id else None
+        sample_name = sample["name"] if sample else ""
+
+        # Строим текущую запись: берём дефолты, поверх — сохранённые
+        # переопределения этого пэда (если редактировали ранее).
+        record = PadInfoRecord()
+        if sample and sample.get("tempo", 0) > 0:
+            bpm = sample["tempo"]
+            if PadInfoRecord.MIN_BPM <= bpm <= PadInfoRecord.MAX_BPM:
+                record.set_bpm(bpm, mode="both")
+        existing = self.padinfo_overrides.get(pad_id, {})
+        for k, v in existing.items():
+            if hasattr(record, k):
+                setattr(record, k, v)
+
+        dlg = PadInfoEditorDialog(pad_id, sample_name, record, parent=self)
+        if dlg.exec() == QDialog.Accepted:
+            values = dlg.get_values()
+            self.padinfo_overrides[pad_id] = values
+            log.info("PADINFO пэда %s обновлён пользователем: %s", pad_id, values)
+            self._flash(f"⚙️ Параметры пэда {pad_id} сохранены")
+            self._save_project()
 
     def _render_pads(self):
         """Обновляет содержимое существующих пэдов (без пересоздания)."""
@@ -796,7 +934,8 @@ class MainWindow(QMainWindow):
 
         self._thread = QThread()
         self._worker = ExportWorker(dict(self.assignments), dict(self.samples),
-                                    out_dir, make_zip=True)
+                                    out_dir, make_zip=True,
+                                    padinfo_records=dict(self.padinfo_overrides))
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.progress.connect(lambda d, t: self.progress.setValue(d))
@@ -861,6 +1000,7 @@ class MainWindow(QMainWindow):
     # ── Проект ──
     def _save_project(self):
         data = {"samples": self.samples, "assignments": self.assignments,
+                "padinfo_overrides": self.padinfo_overrides,
                 "saved": datetime.now().isoformat()}
         try:
             with open(PROJECT_FILE, "w", encoding="utf-8") as f:
@@ -888,6 +1028,7 @@ class MainWindow(QMainWindow):
             self.samples = samples
             self.assignments = {p: s for p, s in data.get("assignments", {}).items()
                                 if s in self.samples}
+            self.padinfo_overrides = dict(data.get("padinfo_overrides", {}))
             log.info("Проект загружен: %d сэмплов, %d назначений%s",
                      len(self.samples), len(self.assignments),
                      f" ({missing} файл(ов) не найдено на диске)" if missing else "")
