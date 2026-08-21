@@ -7,12 +7,19 @@ analyzer.py — Движок анализа и классификации ауд
 from pathlib import Path
 import wave
 
+from .logging_setup import get_logger, log_duration
+
+log = get_logger(__name__)
+
 try:
     import numpy as np
     import librosa
     HAVE_LIBROSA = True
-except ImportError:
+except ImportError as exc:
     HAVE_LIBROSA = False
+    # DEBUG, а не WARNING: librosa опциональна (см. requirements.txt),
+    # приложение штатно работает и без неё — это не ошибка пользователя.
+    log.debug("librosa недоступна, анализ ограничен базовым (wave): %s", exc)
 
 
 SUPPORTED_EXT = {".wav", ".aif", ".aiff", ".mp3", ".flac", ".ogg"}
@@ -43,7 +50,11 @@ def get_duration_basic(filepath: Path) -> float:
     try:
         with wave.open(str(filepath), "rb") as w:
             return w.getnframes() / w.getframerate()
-    except Exception:
+    except Exception as exc:
+        # Фолбэк по умолчанию (0.0) уже не отличить от «файл пуст» —
+        # причина хотя бы остаётся в логе.
+        log.warning("Не удалось определить длительность %s: %s",
+                    filepath.name, exc)
         return 0.0
 
 
@@ -54,53 +65,75 @@ def analyze_sample(filepath: Path) -> dict:
     """
     filepath = Path(filepath)
     if not HAVE_LIBROSA:
-        return {"category": "unknown",
-                "duration": round(get_duration_basic(filepath), 3),
-                "tempo": 0.0, "analyzed": False}
+        result = {"category": "unknown",
+                  "duration": round(get_duration_basic(filepath), 3),
+                  "tempo": 0.0, "analyzed": False}
+        log.debug("Анализ %s пропущен (нет librosa), только длительность",
+                  filepath.name)
+        return result
     try:
         y, sr = librosa.load(str(filepath), sr=None, mono=True, duration=30.0)
     except Exception as e:
+        # Битый файл, неподдерживаемый кодек, поврежденный заголовок —
+        # раньше это тонуло в тихом "analyzed: False", ошибка уходила
+        # в поле error, но нигде не логировалась.
+        log.warning("Не удалось загрузить %s для анализа: %s: %s",
+                    filepath.name, type(e).__name__, e)
         return {"category": "unknown", "duration": 0.0, "tempo": 0.0,
                 "analyzed": False, "error": str(e)}
 
-    duration = librosa.get_duration(y=y, sr=sr)
-    stft = np.abs(librosa.stft(y))
-    freqs = librosa.fft_frequencies(sr=sr)
+    # Извлечение признаков не оборачиваем в try/except: если librosa
+    # упадёт здесь (например, на вырожденном сигнале), исключение должно
+    # дойти до вызывающего кода как и раньше — log_duration лишь добавляет
+    # запись в лог с traceback перед тем как пробросить его дальше.
+    with log_duration(log, "анализ сэмпла", file=filepath.name):
+        duration = librosa.get_duration(y=y, sr=sr)
+        stft = np.abs(librosa.stft(y))
+        freqs = librosa.fft_frequencies(sr=sr)
 
-    cent = float(np.mean(librosa.feature.spectral_centroid(y=y, sr=sr)))
-    zcr = float(np.mean(librosa.feature.zero_crossing_rate(y)))
+        cent = float(np.mean(librosa.feature.spectral_centroid(y=y, sr=sr)))
+        zcr = float(np.mean(librosa.feature.zero_crossing_rate(y)))
 
-    def band(f_lo, f_hi):
-        idx = np.where((freqs >= f_lo) & (freqs < f_hi))[0]
-        return float(np.mean(stft[idx, :] ** 2)) if len(idx) else 0.0
+        def band(f_lo, f_hi):
+            idx = np.where((freqs >= f_lo) & (freqs < f_hi))[0]
+            return float(np.mean(stft[idx, :] ** 2)) if len(idx) else 0.0
 
-    e_lo = band(20, 300); e_mid = band(300, 3000)
-    e_hi = band(3000, 8000); e_air = band(8000, 20000)
-    tot = e_lo + e_mid + e_hi + e_air + 1e-10
-    r_lo, r_mid, r_hi = e_lo / tot, e_mid / tot, e_hi / tot
+        e_lo = band(20, 300); e_mid = band(300, 3000)
+        e_hi = band(3000, 8000); e_air = band(8000, 20000)
+        tot = e_lo + e_mid + e_hi + e_air + 1e-10
+        r_lo, r_mid, r_hi = e_lo / tot, e_mid / tot, e_hi / tot
 
-    rms = librosa.feature.rms(y=y)[0]
-    peak_t = int(np.argmax(rms)) * 512 / sr
-    decay = float(np.mean(rms[len(rms) // 2:])) / (float(np.mean(rms)) + 1e-10)
+        rms = librosa.feature.rms(y=y)[0]
+        peak_t = int(np.argmax(rms)) * 512 / sr
+        decay = float(np.mean(rms[len(rms) // 2:])) / (float(np.mean(rms)) + 1e-10)
 
-    try:
-        tempo = float(librosa.beat.beat_track(y=y, sr=sr)[0])
-    except Exception:
-        tempo = 0.0
-    beats = float(np.mean(librosa.onset.onset_strength(y=y, sr=sr)))
-    harm = librosa.effects.hpss(y)[0]
-    harm_r = float(np.mean(np.abs(harm))) / (float(np.mean(np.abs(y))) + 1e-10)
-    chroma_v = float(np.var(librosa.feature.chroma_stft(y=y, sr=sr)))
+        try:
+            tempo = float(librosa.beat.beat_track(y=y, sr=sr)[0])
+        except Exception as e:
+            # Не критично: детекция темпа регулярно не срабатывает на
+            # коротких/шумных сэмплах (kick, hi-hat) — это ожидаемо,
+            # а не ошибка пользователя, поэтому DEBUG, а не WARNING.
+            log.debug("BPM для %s не определён: %s", filepath.name, e)
+            tempo = 0.0
+        beats = float(np.mean(librosa.onset.onset_strength(y=y, sr=sr)))
+        harm = librosa.effects.hpss(y)[0]
+        harm_r = float(np.mean(np.abs(harm))) / (float(np.mean(np.abs(y))) + 1e-10)
+        chroma_v = float(np.var(librosa.feature.chroma_stft(y=y, sr=sr)))
 
-    feats = dict(duration=duration, cent=cent, zcr=zcr, r_lo=r_lo, r_mid=r_mid,
-                 r_hi=r_hi, peak_t=peak_t, decay=decay, tempo=tempo,
-                 beats=beats, harm=harm_r, chroma=chroma_v)
-    return {
-        "category": _classify(feats),
-        "duration": round(duration, 3),
-        "tempo": round(tempo, 1),
-        "analyzed": True,
-    }
+        feats = dict(duration=duration, cent=cent, zcr=zcr, r_lo=r_lo, r_mid=r_mid,
+                     r_hi=r_hi, peak_t=peak_t, decay=decay, tempo=tempo,
+                     beats=beats, harm=harm_r, chroma=chroma_v)
+        category = _classify(feats)
+        result = {
+            "category": category,
+            "duration": round(duration, 3),
+            "tempo": round(tempo, 1),
+            "analyzed": True,
+        }
+
+    log.debug("Готово: %s -> %s (%.2fс, %.1f BPM)",
+              filepath.name, category, duration, tempo)
+    return result
 
 
 def _classify(f) -> str:

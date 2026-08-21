@@ -15,12 +15,18 @@ import struct
 import wave
 from pathlib import Path
 
+from .logging_setup import get_logger, log_duration
+
+log = get_logger(__name__)
+
 try:
     import numpy as np
     import librosa
     HAVE_LIBROSA = True
-except ImportError:
+except ImportError as exc:
     HAVE_LIBROSA = False
+    log.debug("librosa недоступна, экспорт будет копировать файлы без "
+              "конвертации в 44.1kHz/16-bit: %s", exc)
 
 
 def pad_to_filename(pad: str) -> str:
@@ -36,10 +42,14 @@ def pad_to_padinfo_index(pad: str) -> int:
     pad_num = int(pad[1:])
     bank_idx = ord(bank_char) - ord('A')
     if bank_idx >= 10:
-        raise ValueError(f"Банк {bank_char} не поддерживается (только A-J)")
+        msg = f"Банк {bank_char} не поддерживается (только A-J)"
+        log.error(msg)
+        raise ValueError(msg)
     record_idx = bank_idx * 12 + (pad_num - 1)
     if record_idx >= 120:
-        raise ValueError(f"Пэд {pad} вне диапазона")
+        msg = f"Пэд {pad} вне диапазона"
+        log.error(msg)
+        raise ValueError(msg)
     return record_idx
 
 
@@ -91,10 +101,13 @@ def estimate_sample_frames(filepath: Path) -> tuple:
                 with wave.open(str(filepath), "rb") as w:
                     frames = w.getnframes()
                     return (512, 512 + frames)
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as exc:
+                log.warning("Не удалось прочитать длину %s (wave): %s — "
+                            "PADINFO получит длину-заглушку 1с",
+                            filepath.name, exc)
+    except Exception as exc:
+        log.warning("Не удалось оценить длину %s через librosa: %s — "
+                    "PADINFO получит длину-заглушку 1с", filepath.name, exc)
     return (512, 512 + 44100)
 
 
@@ -118,6 +131,8 @@ def convert_to_sx_wav(src: Path, dst: Path):
             w.setframerate(44100)
             w.writeframes(data.tobytes())
     else:
+        log.debug("librosa недоступна — %s копируется без конвертации "
+                  "(SP-404SX может не принять формат)", src.name)
         shutil.copy2(str(src), str(dst))
 
 
@@ -126,34 +141,47 @@ def export_sd(assignments: dict, samples: dict, out_dir: Path,
     """Экспортирует сэмплы и PADINFO.BIN."""
     out_dir = Path(out_dir)
     smpl_dir = out_dir / "ROLAND" / "SP-404SX" / "SMPL"
+
+    log.info("Экспорт: %d пэдов -> %s", len(assignments), out_dir)
     if out_dir.exists():
+        log.debug("Целевой каталог существует, удаляю: %s", out_dir)
         shutil.rmtree(out_dir)
     smpl_dir.mkdir(parents=True, exist_ok=True)
 
     exported, errors = [], []
     items = list(assignments.items())
     total = len(items)
-    
+
     if padinfo_records is None:
         padinfo_records = {}
 
     # Экспортируем WAV-файлы
-    for i, (pad, sid) in enumerate(items):
-        s = samples.get(sid)
-        if not s:
-            continue
-        src = Path(s["path"])
-        if not src.exists():
-            errors.append(f"{pad}: файл отсутствует ({s.get('name','?')})")
-            continue
-        dst = smpl_dir / pad_to_filename(pad)
-        try:
-            convert_to_sx_wav(src, dst)
-            exported.append({"pad": pad, "file": dst.name, "sample": s["name"]})
-        except Exception as e:
-            errors.append(f"{pad}: {e}")
-        if progress_cb:
-            progress_cb(i + 1, total)
+    with log_duration(log, "конвертация сэмплов", count=total):
+        for i, (pad, sid) in enumerate(items):
+            s = samples.get(sid)
+            if not s:
+                log.warning("Пэд %s ссылается на несуществующий сэмпл %s "
+                            "— пропущен", pad, sid)
+                continue
+            src = Path(s["path"])
+            if not src.exists():
+                msg = f"{pad}: файл отсутствует ({s.get('name','?')})"
+                log.warning(msg)
+                errors.append(msg)
+                continue
+            dst = smpl_dir / pad_to_filename(pad)
+            try:
+                convert_to_sx_wav(src, dst)
+                exported.append({"pad": pad, "file": dst.name, "sample": s["name"]})
+            except Exception as e:
+                # Конвертация — единственное, что реально портит экспорт:
+                # без лога пользователь видел бы просто "ошибок: N" без
+                # единого шанса понять, какой файл и почему.
+                log.exception("Конвертация %s (пэд %s) не удалась",
+                              s.get("name", src.name), pad)
+                errors.append(f"{pad}: {e}")
+            if progress_cb:
+                progress_cb(i + 1, total)
 
     # Создаём PADINFO.BIN
     padinfo_path = smpl_dir / "PADINFO.BIN"
@@ -164,7 +192,7 @@ def export_sd(assignments: dict, samples: dict, out_dir: Path,
                 for pad_num in range(1, 13):  # 1-12
                     pad_id = f"{bank_char}{pad_num}"
                     rec = PadInfoRecord()
-                    
+
                     if pad_id in padinfo_records:
                         custom = padinfo_records[pad_id]
                         if isinstance(custom, dict):
@@ -188,12 +216,23 @@ def export_sd(assignments: dict, samples: dict, out_dir: Path,
                                     rec.orig_tempo = tempo_val
                                     rec.user_tempo = tempo_val
                             except Exception:
-                                pass
-                    
+                                log.warning(
+                                    "Метаданные для пэда %s (%s) не "
+                                    "рассчитаны, использую значения "
+                                    "по умолчанию", pad_id, s.get("name", "?"),
+                                    exc_info=True)
+
                     pf.write(rec.to_bytes())
     except Exception as e:
+        # Сбой записи PADINFO.BIN — это не «ошибка одного пэда», а порча
+        # структуры SD-карты целиком: SP-404SX может не увидеть ни один
+        # сэмпл. Такое должно быть максимально заметно в логе.
+        log.exception("Не удалось записать PADINFO.BIN — SD-карта "
+                      "будет нерабочей")
         errors.append(f"PADINFO.BIN: {e}")
 
+    log.info("Экспорт завершён: успешно=%d, ошибок=%d",
+             len(exported), len(errors))
     return {
         "exported": exported,
         "errors": errors,
@@ -220,9 +259,20 @@ def auto_assign(samples: dict, banks: list, pads_per_bank: int) -> dict:
             b = bank_idx + (i // pads_per_bank)
             p = (i % pads_per_bank) + 1
             if b >= len(banks):
+                # Банки закончились — оставшиеся сэмплы категории (и все
+                # последующие категории) молча не получают пэд. Раньше
+                # это было незаметно: счётчик "назначено" в UI просто
+                # оказывался меньше числа сэмплов без единого сообщения.
+                log.warning("Банки закончились: %d сэмпл(ов) категории "
+                            "'%s' не поместились", len(group) - i, cat)
                 break
             assignments[f"{banks[b]}{p}"] = sid
         bank_idx += max(1, (len(group) + pads_per_bank - 1) // pads_per_bank)
         if bank_idx >= len(banks):
             break
+
+    not_placed = len(samples) - len(assignments)
+    log.debug("Авто-раскладка: %d сэмплов -> %d пэдов назначено%s",
+              len(samples), len(assignments),
+              f", {not_placed} не поместилось" if not_placed else "")
     return assignments
