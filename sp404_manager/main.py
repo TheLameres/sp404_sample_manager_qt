@@ -9,15 +9,18 @@
 ╚══════════════════════════════════════════════════════════════╝
 """
 
+import logging
 import sys
 import json
+import threading
 import uuid
 import shutil
 from pathlib import Path
 from datetime import datetime
 
 from PySide6.QtCore import (Qt, QThread, Signal, QObject, QUrl, QSize,
-                            QMimeData, QByteArray, QTimer)
+                            QMimeData, QByteArray, QTimer, QtMsgType,
+                            qInstallMessageHandler)
 from PySide6.QtGui import QFont, QColor, QPalette, QIcon, QDrag, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -31,20 +34,43 @@ from .analyzer import (analyze_sample, CATEGORY_META, CATEGORY_ORDER,
                        SUPPORTED_EXT, HAVE_LIBROSA)
 from .exporter import export_sd, auto_assign, pad_to_filename
 from .platform_utils import get_app_dir, get_platform
+from .logging_setup import (setup_logging, get_logger, log_system_info,
+                            get_log_file, shutdown_logging)
+
+log = get_logger(__name__)
+_qt_log = get_logger("sp404_manager.qt")
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
 #  Конфигурация
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
 BANKS = list("ABCDEFGHIJKL")           # 12 банков
 PADS_PER_BANK = 12
 APP_DIR = Path(get_app_dir())
-APP_DIR.mkdir(parents=True, exist_ok=True)
 SAMPLES_DIR = APP_DIR / "samples"
-SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
 PROJECT_FILE = APP_DIR / "project.json"
 
 MIME_SAMPLE = "application/x-sp404-sample-id"
+
+
+def ensure_app_dirs() -> bool:
+    """Создаёт рабочие каталоги приложения.
+
+    Раньше mkdir() выполнялся на уровне модуля, то есть при импорте —
+    до того, как логирование настроено. Сбой (read-only том, нет прав,
+    отсутствующий %APPDATA%) приводил к падению на импорте вообще без
+    диагностики. Теперь это явный вызов из main() и MainWindow.__init__.
+    """
+    ok = True
+    for d in (APP_DIR, SAMPLES_DIR):
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            log.exception("Не удалось создать рабочий каталог %s", d)
+            ok = False
+    if ok:
+        log.debug("Рабочие каталоги готовы: %s", APP_DIR)
+    return ok
 
 
 # ─────────────────────────────────────────────
@@ -346,6 +372,9 @@ class SampleList(QListWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        # Каталоги создаём здесь, а не на импорте модуля: headless-тесты
+        # и внешние скрипты конструируют окно напрямую, минуя main().
+        ensure_app_dirs()
         self.setWindowTitle("SP-404SX Sample Manager — by SYNTX.AI")
         self.resize(1180, 780)
         self.setAcceptDrops(True)
@@ -776,9 +805,91 @@ class MainWindow(QMainWindow):
         self.status.showMessage(msg, 5000)
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
+#  Глобальные перехватчики ошибок
+# ─────────────────────────────────────────────────────────────────────
+_QT_MSG_LEVELS = {
+    QtMsgType.QtDebugMsg:    logging.DEBUG,
+    QtMsgType.QtInfoMsg:     logging.INFO,
+    QtMsgType.QtWarningMsg:  logging.WARNING,
+    QtMsgType.QtCriticalMsg: logging.ERROR,
+    QtMsgType.QtFatalMsg:    logging.CRITICAL,
+}
+
+
+def _qt_message_handler(mode, context, message):
+    """Перенаправляет диагностику Qt в logging.
+
+    Предупреждения Qt (проблемы компоновки, отсутствующие мультимедиа-
+    бэкенды, ошибки QMediaPlayer) писались прямо в stderr и в собранном
+    .app пропадали бесследно.
+    """
+    level = _QT_MSG_LEVELS.get(mode, logging.INFO)
+    where = ""
+    if context is not None and getattr(context, "file", None):
+        where = f" ({context.file}:{context.line})"
+    _qt_log.log(level, "%s%s", message, where)
+
+
+def _show_crash_dialog(exc_value) -> None:
+    """Показывает пользователю диалог о сбое с путём к файлу лога."""
+    try:
+        if QApplication.instance() is None:
+            return
+        log_path = get_log_file()
+        box = QMessageBox()
+        box.setIcon(QMessageBox.Critical)
+        box.setWindowTitle("Непредвиденная ошибка")
+        box.setText("Произошла непредвиденная ошибка.\n"
+                    "Приложение продолжит работу, но состояние может быть "
+                    "некорректным.")
+        box.setInformativeText(f"{type(exc_value).__name__}: {exc_value}")
+        if log_path:
+            box.setDetailedText(f"Подробности записаны в лог:\n{log_path}")
+        box.exec()
+    except Exception:
+        # Диалог — не критичный путь: traceback уже в логе.
+        log.exception("Не удалось показать диалог об ошибке")
+
+
+def _excepthook(exc_type, exc_value, exc_tb):
+    """sys.excepthook — необработанные исключения главного потока."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+        return
+    log.critical("Необработанное исключение в главном потоке",
+                 exc_info=(exc_type, exc_value, exc_tb))
+    _show_crash_dialog(exc_value)
+
+
+def _thread_excepthook(args):
+    """threading.excepthook — необработанные исключения фоновых потоков.
+
+    Внимание: QThread создаётся средствами Qt, а не модулем threading,
+    поэтому падение внутри AnalyzeWorker.run/ExportWorker.run этот хук
+    перехватит не во всех сборках PySide6. Надёжная защита воркеров —
+    явный try/except в самих run() (шаг 4). Хук оставлен как страховка
+    и покрывает обычные threading.Thread.
+    """
+    if issubclass(args.exc_type, SystemExit):
+        return
+    log.critical("Необработанное исключение в потоке %s",
+                 getattr(args.thread, "name", "?"),
+                 exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+
+def install_error_handlers() -> None:
+    """Ставит перехватчики. Вызывать один раз, до создания QApplication."""
+    sys.excepthook = _excepthook
+    if hasattr(threading, "excepthook"):        # Python 3.8+
+        threading.excepthook = _thread_excepthook
+    qInstallMessageHandler(_qt_message_handler)
+    log.debug("Глобальные перехватчики ошибок установлены")
+
+
+# ─────────────────────────────────────────────────────────────────────
 #  Точка входа
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
 def _default_font_family() -> str:
     """Системный шрифт под текущую ОС (на macOS нет 'Segoe UI')."""
     plat = get_platform()
@@ -790,6 +901,14 @@ def _default_font_family() -> str:
 
 
 def main():
+    # Логирование поднимаем самым первым — до Qt, до создания каталогов,
+    # чтобы любой последующий сбой оказался в файле.
+    setup_logging()
+    log_system_info()
+    install_error_handlers()
+    ensure_app_dirs()
+
+    log.info("Запуск приложения")
     app = QApplication(sys.argv)
     app.setApplicationName("SP-404SX Sample Manager")
     app.setApplicationDisplayName("SP-404SX Sample Manager")
@@ -800,7 +919,12 @@ def main():
     app.setStyleSheet(STYLESHEET)
     win = MainWindow()
     win.show()
-    sys.exit(app.exec())
+
+    log.info("Главное окно показано, вход в цикл событий")
+    rc = app.exec()
+    log.info("Цикл событий завершён, код возврата=%s", rc)
+    shutdown_logging()
+    sys.exit(rc)
 
 
 if __name__ == "__main__":

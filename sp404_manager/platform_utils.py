@@ -5,6 +5,10 @@ Platform detection and app initialization utilities.
 import sys
 import platform
 
+from .logging_setup import get_logger
+
+log = get_logger(__name__)
+
 
 def get_platform() -> str:
     """Определяет платформу: 'macos', 'linux', 'windows'."""
@@ -40,43 +44,41 @@ def get_app_dir() -> str:
         # %APPDATA%\SP-404SX Manager\
         import os
         appdata = os.getenv("APPDATA")
+        if not appdata:
+            # Иначе путь превращался в литерал "None\SP-404SX Manager"
+            # и данные молча уезжали в текущий каталог.
+            log.warning("%%APPDATA%% не задан — использую домашний каталог")
+            return str(Path.home() / "SP-404SX Manager")
         return f"{appdata}\\SP-404SX Manager"
     return str(Path.home() / ".sp404_manager")
 
 
 def check_dependencies() -> dict:
-    """Проверяет доступность зависимостей."""
-    result = {
-        "pyside6": False,
-        "librosa": False,
-        "numpy": False,
-        "soundfile": False,
+    """Проверяет доступность зависимостей.
+
+    Причина каждого ImportError пишется в лог на уровне DEBUG: раньше
+    отсутствие librosa было неотличимо от её поломки (битый numba,
+    несовместимый numpy) — и то и другое молча давало False.
+    """
+    import importlib
+
+    modules = {
+        "pyside6": "PySide6",
+        "librosa": "librosa",
+        "numpy": "numpy",
+        "soundfile": "soundfile",
     }
-    
-    try:
-        import PySide6
-        result["pyside6"] = True
-    except ImportError:
-        pass
-    
-    try:
-        import librosa
-        result["librosa"] = True
-    except ImportError:
-        pass
-    
-    try:
-        import numpy
-        result["numpy"] = True
-    except ImportError:
-        pass
-    
-    try:
-        import soundfile
-        result["soundfile"] = True
-    except ImportError:
-        pass
-    
+    result = {}
+    for key, module_name in modules.items():
+        try:
+            importlib.import_module(module_name)
+            result[key] = True
+        except Exception as exc:
+            # Ловим Exception, а не только ImportError: у librosa импорт
+            # умеет падать на OSError/RuntimeError из-за нативных библиотек.
+            result[key] = False
+            log.debug("Зависимость %s недоступна: %s: %s",
+                      module_name, type(exc).__name__, exc)
     return result
 
 
