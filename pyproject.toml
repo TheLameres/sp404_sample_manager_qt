@@ -1,0 +1,53 @@
+[project]
+name = "sp404-manager"
+version = "1.0.1"
+description = "SP-404SX Sample Manager — Desktop app for Roland SP-404SX with auto-classification, drag&drop assignment, and SD-card export (PADINFO.BIN)"
+authors = [{name = "SYNTX.AI"}]
+license = "MIT"
+readme = "README.md"
+keywords = ["sp-404sx", "roland", "sampler", "audio", "music", "pyside6"]
+requires-python = ">=3.9,<3.14"
+dependencies = [
+    "PySide6>=6.6",
+]
+
+[project.optional-dependencies]
+# pip install ".[analysis]"  /  poetry install --extras analysis
+analysis = ["librosa>=0.10", "numpy>=1.24", "soundfile>=0.12"]
+all = ["librosa>=0.10", "numpy>=1.24", "soundfile>=0.12"]
+
+[project.urls]
+Homepage = "https://syntx.ai"
+
+[project.scripts]
+sp404-manager = "sp404_manager.main:main"
+
+[tool.poetry]
+packages = [{include = "sp404_manager"}]
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.0"
+black = "^23.0"
+flake8 = "^6.0"
+
+# Инструменты сборки standalone-приложений (macOS/Windows)
+# poetry install --with build
+[tool.poetry.group.build]
+optional = true
+
+[tool.poetry.group.build.dependencies]
+pillow = "^10.0"           # генерация иконки
+py2app = {version = "^0.28", markers = "sys_platform == 'darwin'"}
+pyinstaller = "^6.0"       # кросс-платформенная альтернатива
+
+[build-system]
+requires = ["poetry-core>=1.5"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 100
+target-version = ["py39"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"

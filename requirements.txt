@@ -1,0 +1,16 @@
+# ── SP-404SX Sample Manager — pip зависимости (fallback для тех, кто без Poetry) ──
+# Рекомендуется Poetry: poetry install --extras analysis
+
+# GUI (обязательно)
+PySide6>=6.6
+
+# Аудио-анализ и конвертация (опционально — авто-классификация + BPM detection)
+librosa>=0.10
+numpy>=1.24
+soundfile>=0.12
+
+# ── Только для сборки standalone .app/.dmg на macOS ──
+# pip install pillow py2app
+# pillow>=10.0
+# py2app>=0.28   ; sys_platform == "darwin"
+# pyinstaller>=6.0
