@@ -54,8 +54,42 @@ def pad_to_padinfo_index(pad: str) -> int:
 
 
 class PadInfoRecord:
-    """Одна запись (32 байта) в PADINFO.BIN."""
-    
+    """Одна запись (32 байта) в PADINFO.BIN.
+
+    Бинарная раскладка (big-endian), согласно спецификации
+    https://gist.github.com/threedaymonk/701ca30e5d363caa288986ad972ab3e0
+    и уттори-парсеру uttori-audio-padinfo:
+
+        offset  поле              тип
+        0       orig_sample_start uint32
+        4       orig_sample_end   uint32
+        8       user_sample_start uint32
+        12      user_sample_end   uint32
+        16      volume            uint8   (0-127)
+        17      lofi              uint8   (0/1)
+        18      loop              uint8   (0/1)
+        19      gate              uint8   (0/1)
+        20      reverse           uint8   (0/1)
+        21      format            uint8   (0=AIFF, 1=WAVE)
+        22      channels          uint8   (1=mono, 2=stereo)
+        23      tempo_mode        uint8   (0=Off, 1=Pattern, 2=User)
+        24      orig_tempo        uint32  (BPM × 10)
+        28      user_tempo        uint32  (BPM × 10)
+
+    Итого 32 байта. ВАЖНО: OrigTempo/UserTempo — это uint32, а не uint16,
+    как было в предыдущей (ошибочной) реализации — старый код упаковывал
+    tempo как два uint16 + 6 нулевых байт, из-за чего реальные значения
+    BPM попадали в поля Channels/TempoMode и OrigTempo/UserTempo читались
+    как мусор при разборе по спецификации.
+    """
+
+    #: struct-формат одной записи (32 байта, big-endian)
+    STRUCT_FMT = ">IIII BBBBBBBB II"
+
+    # Допустимые диапазоны для валидации
+    MIN_BPM = 20.0
+    MAX_BPM = 300.0
+
     def __init__(self):
         self.orig_sample_start = 512
         self.orig_sample_end = 512 + 44100
@@ -66,14 +100,61 @@ class PadInfoRecord:
         self.loop = 0
         self.gate = 1
         self.reverse = 0
-        self.format = 1
+        self.format = 1              # 1 = WAVE (проект всегда экспортирует WAV)
+        self.channels = 2            # 1 = mono, 2 = stereo
+        self.tempo_mode = 0          # 0=Off, 1=Pattern, 2=User
         self.orig_tempo = 1200       # 120 BPM × 10
         self.user_tempo = 1200
-    
+
+    def validate(self) -> None:
+        """Проверяет диапазоны полей перед упаковкой. Бросает ValueError."""
+        def _check_bit(name, value):
+            if value not in (0, 1):
+                raise ValueError(f"{name} должен быть 0 или 1, получено {value!r}")
+
+        if not (0 <= self.volume <= 127):
+            raise ValueError(f"volume должен быть в диапазоне 0-127, получено {self.volume!r}")
+        _check_bit("lofi", self.lofi)
+        _check_bit("loop", self.loop)
+        _check_bit("gate", self.gate)
+        _check_bit("reverse", self.reverse)
+        if self.format not in (0, 1):
+            raise ValueError(f"format должен быть 0 (AIFF) или 1 (WAVE), получено {self.format!r}")
+        if self.channels not in (1, 2):
+            raise ValueError(f"channels должен быть 1 (mono) или 2 (stereo), получено {self.channels!r}")
+        if self.tempo_mode not in (0, 1, 2):
+            raise ValueError(f"tempo_mode должен быть 0/1/2 (Off/Pattern/User), получено {self.tempo_mode!r}")
+        for name, tempo in (("orig_tempo", self.orig_tempo), ("user_tempo", self.user_tempo)):
+            bpm = tempo / 10.0
+            if not (self.MIN_BPM <= bpm <= self.MAX_BPM):
+                raise ValueError(
+                    f"{name}={tempo} ({bpm} BPM) вне диапазона "
+                    f"{self.MIN_BPM}-{self.MAX_BPM} BPM"
+                )
+        for name in ("orig_sample_start", "orig_sample_end",
+                     "user_sample_start", "user_sample_end"):
+            value = getattr(self, name)
+            if not (0 <= value <= 0xFFFFFFFF):
+                raise ValueError(f"{name}={value} вне диапазона uint32")
+
+    def set_bpm(self, bpm: float, mode: str = "user") -> None:
+        """Устанавливает BPM. mode: 'user' — только user_tempo,
+        'orig' — только orig_tempo, 'both' — оба поля."""
+        if not (self.MIN_BPM <= bpm <= self.MAX_BPM):
+            raise ValueError(f"bpm={bpm} вне диапазона {self.MIN_BPM}-{self.MAX_BPM}")
+        tempo_val = round(bpm * 10)
+        if mode not in ("user", "orig", "both"):
+            raise ValueError("mode должен быть 'user', 'orig' или 'both'")
+        if mode in ("user", "both"):
+            self.user_tempo = tempo_val
+        if mode in ("orig", "both"):
+            self.orig_tempo = tempo_val
+
     def to_bytes(self) -> bytes:
         """Кодирует в 32 байта (big-endian)."""
+        self.validate()
         return struct.pack(
-            ">IIII BBBBBB HH 6s",
+            self.STRUCT_FMT,
             self.orig_sample_start,
             self.orig_sample_end,
             self.user_sample_start,
@@ -84,10 +165,82 @@ class PadInfoRecord:
             self.gate,
             self.reverse,
             self.format,
+            self.channels,
+            self.tempo_mode,
             self.orig_tempo,
             self.user_tempo,
-            b'\x00' * 6
         )
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "PadInfoRecord":
+        """Разбирает 32 байта записи PADINFO.BIN в PadInfoRecord."""
+        expected_size = struct.calcsize(cls.STRUCT_FMT)
+        if len(data) != expected_size:
+            raise ValueError(
+                f"Ожидалось {expected_size} байт на запись, получено {len(data)}"
+            )
+        (orig_start, orig_end, user_start, user_end,
+         volume, lofi, loop, gate, reverse, fmt,
+         channels, tempo_mode, orig_tempo, user_tempo) = struct.unpack(cls.STRUCT_FMT, data)
+
+        rec = cls()
+        rec.orig_sample_start = orig_start
+        rec.orig_sample_end = orig_end
+        rec.user_sample_start = user_start
+        rec.user_sample_end = user_end
+        rec.volume = volume
+        rec.lofi = lofi
+        rec.loop = loop
+        rec.gate = gate
+        rec.reverse = reverse
+        rec.format = fmt
+        rec.channels = channels
+        rec.tempo_mode = tempo_mode
+        rec.orig_tempo = orig_tempo
+        rec.user_tempo = user_tempo
+        return rec
+
+
+#: Число записей в PADINFO.BIN и размер каждой записи в байтах
+PADINFO_RECORD_COUNT = 120
+PADINFO_RECORD_SIZE = struct.calcsize(PadInfoRecord.STRUCT_FMT)
+
+
+def padinfo_index_to_pad(index: int) -> str:
+    """Обратное преобразование индекса записи (0-119) в идентификатор пэда 'A1'-'J12'."""
+    if not (0 <= index < PADINFO_RECORD_COUNT):
+        raise ValueError(f"index={index} вне диапазона 0-{PADINFO_RECORD_COUNT - 1}")
+    bank_idx, pad_num = divmod(index, 12)
+    bank_char = chr(ord('A') + bank_idx)
+    return f"{bank_char}{pad_num + 1}"
+
+
+def parse_padinfo(path: Path) -> dict:
+    """Читает существующий PADINFO.BIN и возвращает {pad_id: PadInfoRecord}.
+
+    Ожидается файл из ровно PADINFO_RECORD_COUNT записей по
+    PADINFO_RECORD_SIZE байт каждая (итого 120 × 32 = 3840 байт).
+    """
+    path = Path(path)
+    data = path.read_bytes()
+    expected_size = PADINFO_RECORD_COUNT * PADINFO_RECORD_SIZE
+    if len(data) != expected_size:
+        log.warning(
+            "PADINFO.BIN %s: ожидалось %d байт (%d записей по %d), "
+            "получено %d — файл может быть повреждён или из другой модели",
+            path, expected_size, PADINFO_RECORD_COUNT, PADINFO_RECORD_SIZE, len(data)
+        )
+
+    records = {}
+    n_records = len(data) // PADINFO_RECORD_SIZE
+    for i in range(min(n_records, PADINFO_RECORD_COUNT)):
+        chunk = data[i * PADINFO_RECORD_SIZE:(i + 1) * PADINFO_RECORD_SIZE]
+        pad_id = padinfo_index_to_pad(i)
+        try:
+            records[pad_id] = PadInfoRecord.from_bytes(chunk)
+        except Exception:
+            log.exception("Не удалось разобрать запись PADINFO для пэда %s", pad_id)
+    return records
 
 
 def estimate_sample_frames(filepath: Path) -> tuple:
@@ -211,10 +364,9 @@ def export_sd(assignments: dict, samples: dict, out_dir: Path,
                                 rec.orig_sample_end = end
                                 rec.user_sample_start = start
                                 rec.user_sample_end = end
-                                if s.get("tempo", 0) > 0:
-                                    tempo_val = int(s["tempo"] * 10)
-                                    rec.orig_tempo = tempo_val
-                                    rec.user_tempo = tempo_val
+                                bpm = s.get("tempo", 0)
+                                if bpm and PadInfoRecord.MIN_BPM <= bpm <= PadInfoRecord.MAX_BPM:
+                                    rec.set_bpm(bpm, mode="both")
                             except Exception:
                                 log.warning(
                                     "Метаданные для пэда %s (%s) не "
