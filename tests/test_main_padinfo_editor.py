@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 # QApplication нужен один на процесс — создаём фикстурой сессии
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 
@@ -111,8 +112,15 @@ def test_padinfo_editor_dialog_values_apply_cleanly_to_record(qapp):
 
 def test_main_window_edit_pad_info_stores_override(qapp, clean_app_dir):
     """_edit_pad_info должен сохранять переопределения в
-    self.padinfo_overrides без открытия модального диалога
-    (эмулируем через прямой вызов внутренней логики)."""
+    self.padinfo_overrides через non-modal диалог (dlg.show() +
+    сигнал finished), НЕ блокируя главный event loop.
+
+    Раньше здесь использовался модальный dlg.exec(), который блокировал
+    все кнопки MainWindow до закрытия диалога — это и был баг. Теперь
+    диалог открывается через show() (не блокирует), а сохранение
+    происходит в слоте _on_padinfo_dialog_finished, подключённом
+    к сигналу QDialog.finished.
+    """
     from sp404_manager.main import MainWindow, PadInfoEditorDialog
     from PySide6.QtWidgets import QDialog
 
@@ -120,23 +128,56 @@ def test_main_window_edit_pad_info_stores_override(qapp, clean_app_dir):
     try:
         assert win.padinfo_overrides == {}
 
-        # Подменяем exec(), чтобы не блокировать тест модальным окном
-        def fake_exec(self):
+        # Подменяем show(), чтобы не показывать реальное окно в тесте,
+        # но выставляем значения и сами эмулируем сигнал finished —
+        # так же, как это сделал бы пользователь, нажав "OK".
+        captured_dialogs = []
+
+        def fake_show(self):
             self.bpm_spin.setValue(133.3)
             self.gate_check.setChecked(False)
-            return QDialog.Accepted
+            captured_dialogs.append(self)
+            self.finished.emit(QDialog.Accepted)
 
-        orig_exec = PadInfoEditorDialog.exec
-        PadInfoEditorDialog.exec = fake_exec
+        orig_show = PadInfoEditorDialog.show
+        PadInfoEditorDialog.show = fake_show
         try:
             win._edit_pad_info("A1")
         finally:
-            PadInfoEditorDialog.exec = orig_exec
+            PadInfoEditorDialog.show = orig_show
+
+        assert len(captured_dialogs) == 1
+        # Диалог должен быть non-modal — иначе баг с блокировкой вернётся
+        assert captured_dialogs[0].windowModality() == Qt.NonModal
 
         assert "A1" in win.padinfo_overrides
         assert win.padinfo_overrides["A1"]["orig_tempo"] == 1333
         assert win.padinfo_overrides["A1"]["user_tempo"] == 1333
         assert win.padinfo_overrides["A1"]["gate"] == 0
+    finally:
+        win.deleteLater()
+
+
+def test_main_window_stays_responsive_during_dialog(qapp, clean_app_dir):
+    """Регрессионный тест бага: после открытия PadInfoEditorDialog
+    главное окно и его действия (например, назначение пэдов) должны
+    оставаться доступными, то есть диалог не должен быть модальным
+    и не должен блокировать вызовы других методов MainWindow."""
+    from sp404_manager.main import MainWindow
+
+    win = MainWindow()
+    try:
+        win._edit_pad_info("A1")  # открывает non-modal диалог (show())
+
+        # Если бы диалог был модальным (exec()), этот код не выполнился
+        # бы, пока пользователь не закроет диалог. С non-modal show()
+        # управление возвращается сразу — проверяем, что MainWindow
+        # по-прежнему реагирует на обычные действия.
+        win._switch_bank("B")
+        assert win.cur_bank == "B"
+
+        win._flash("тест доступности главного окна")
+        assert "тест доступности" in win.statusBar().currentMessage()
     finally:
         win.deleteLater()
 

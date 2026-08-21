@@ -726,13 +726,35 @@ class MainWindow(QMainWindow):
             if hasattr(record, k):
                 setattr(record, k, v)
 
+        # Диалог открывается как non-modal: dlg.exec() блокирует весь Qt
+        # event loop главного окна (кнопки, drag&drop, экспорт перестают
+        # отвечать до закрытия диалога) — это и есть баг, о котором сообщил
+        # пользователь. Используем dlg.show() + сигнал finished вместо
+        # блокирующего exec(), чтобы главное окно оставалось отзывчивым.
         dlg = PadInfoEditorDialog(pad_id, sample_name, record, parent=self)
-        if dlg.exec() == QDialog.Accepted:
-            values = dlg.get_values()
-            self.padinfo_overrides[pad_id] = values
-            log.info("PADINFO пэда %s обновлён пользователем: %s", pad_id, values)
-            self._flash(f"⚙️ Параметры пэда {pad_id} сохранены")
-            self._save_project()
+        dlg.setWindowModality(Qt.NonModal)
+        dlg.finished.connect(
+            lambda result: self._on_padinfo_dialog_finished(dlg, pad_id, result))
+        dlg.show()
+
+    def _on_padinfo_dialog_finished(self, dlg, pad_id, result):
+        """Слот для non-modal PadInfoEditorDialog — вызывается при закрытии.
+
+        Не блокирует главный event loop (в отличие от dlg.exec()),
+        поэтому кнопки и другие действия в MainWindow остаются доступны,
+        пока диалог открыт.
+        """
+        if result == QDialog.Accepted:
+            try:
+                values = dlg.get_values()
+                self.padinfo_overrides[pad_id] = values
+                log.info("PADINFO пэда %s обновлён пользователем: %s", pad_id, values)
+                self._flash(f"⚙️ Параметры пэда {pad_id} сохранены")
+                self._save_project()
+            except Exception:
+                log.exception("Не удалось сохранить параметры пэда %s", pad_id)
+                self._flash(f"⚠️ Не удалось сохранить параметры пэда {pad_id}")
+        dlg.deleteLater()
 
     def _render_pads(self):
         """Обновляет содержимое существующих пэдов (без пересоздания)."""
